@@ -26,6 +26,9 @@
 
 #ifdef MSDFGEN_USE_SKIA
 #include <skia/core/SkPath.h>
+#include <skia/core/SkPaint.h>
+#include <skia/core/SkStrokeRec.h>
+#include <skia/core/SkPathBuilder.h>
 #include <skia/utils/SkParsePath.h>
 #include <skia/pathops/SkPathOps.h>
 #endif
@@ -603,6 +606,78 @@ int loadSvgShape(Shape &output, Shape::Bounds &viewBox, const char *filename) {
 
 void shapeFromSkiaPath(Shape &shape, const SkPath &skPath); // defined in resolve-shape-geometry.cpp
 
+struct SvgStyle {
+    bool hasFill;
+    bool hasStroke;
+    double strokeWidth;
+    SkPaint::Cap strokeCap;
+    SkPaint::Join strokeJoin;
+
+    SvgStyle() : hasFill(true), hasStroke(false), strokeWidth(1.0), strokeCap(SkPaint::kButt_Cap), strokeJoin(SkPaint::kMiter_Join) { }
+};
+
+static void readStyle(SvgStyle &style, const char *fill, const char *stroke, const char *strokeWidth, const char *strokeLinecap, const char *strokeLinejoin) {
+    if (fill) {
+        if (!strcmp(fill, "none"))
+            style.hasFill = false;
+        else
+            style.hasFill = true;
+    }
+    if (stroke) {
+        if (!strcmp(stroke, "none"))
+            style.hasStroke = false;
+        else
+            style.hasStroke = true;
+    }
+    if (strokeWidth) {
+        const char *sw = strokeWidth;
+        double w;
+        if (readDouble(w, sw))
+            style.strokeWidth = w;
+    }
+    if (strokeLinecap) {
+        if (!strcmp(strokeLinecap, "butt"))
+            style.strokeCap = SkPaint::kButt_Cap;
+        else if (!strcmp(strokeLinecap, "round"))
+            style.strokeCap = SkPaint::kRound_Cap;
+        else if (!strcmp(strokeLinecap, "square"))
+            style.strokeCap = SkPaint::kSquare_Cap;
+    }
+    if (strokeLinejoin) {
+        if (!strcmp(strokeLinejoin, "miter"))
+            style.strokeJoin = SkPaint::kMiter_Join;
+        else if (!strcmp(strokeLinejoin, "round"))
+            style.strokeJoin = SkPaint::kRound_Join;
+        else if (!strcmp(strokeLinejoin, "bevel"))
+            style.strokeJoin = SkPaint::kBevel_Join;
+    }
+}
+
+static void applyPath(SkPath &fullPath, int &flags, const SkPath &curPath, const SvgStyle &style) {
+    if (style.hasFill) {
+        if (Op(fullPath, curPath, kUnion_SkPathOp, &fullPath))
+            flags |= SVG_IMPORT_SUCCESS_FLAG;
+        else
+            flags |= SVG_IMPORT_PARTIAL_FAILURE_FLAG;
+    }
+    if (style.hasStroke && style.strokeWidth > 0) {
+        SkPaint paint;
+        paint.setStyle(SkPaint::kStroke_Style);
+        paint.setStrokeWidth(SkScalar(style.strokeWidth));
+        paint.setStrokeCap(style.strokeCap);
+        paint.setStrokeJoin(style.strokeJoin);
+        SkStrokeRec rec(paint, SkPaint::kStroke_Style, 256.0f);
+        SkPathBuilder builder;
+        if (rec.applyToPath(&builder, curPath)) {
+            SkPath strokedPath = builder.detach();
+            if (Op(fullPath, strokedPath, kUnion_SkPathOp, &fullPath))
+                flags |= SVG_IMPORT_SUCCESS_FLAG;
+            else
+                flags |= SVG_IMPORT_PARTIAL_FAILURE_FLAG;
+        }
+    }
+}
+
 static bool readTransformationOp(SkScalar dst[6], int &count, const char *&str, const char *name) {
     int nameLen = int(strlen(name));
     if (!memcmp(str, name, nameLen)) {
@@ -680,10 +755,11 @@ static SkMatrix combineTransformation(int &flags, const SkMatrix &parentTransfor
 
 #ifdef MSDFGEN_USE_TINYXML2
 
-static void gatherPaths(SkPath &fullPath, int &flags, tinyxml2::XMLElement *parent, const SkMatrix &transformation) {
+static void gatherPaths(SkPath &fullPath, int &flags, tinyxml2::XMLElement *parent, const SkMatrix &transformation, SvgStyle style) {
+    readStyle(style, parent->Attribute("fill"), parent->Attribute("stroke"), parent->Attribute("stroke-width"), parent->Attribute("stroke-linecap"), parent->Attribute("stroke-linejoin"));
     for (tinyxml2::XMLElement *cur = parent->FirstChildElement(); cur && !FLAGS_FINAL(flags); cur = cur->NextSiblingElement()) {
         if (!strcmp(cur->Name(), "g"))
-            gatherPaths(fullPath, flags, cur, combineTransformation(flags, transformation, cur->Attribute("transform"), cur->Attribute("transform-origin")));
+            gatherPaths(fullPath, flags, cur, combineTransformation(flags, transformation, cur->Attribute("transform"), cur->Attribute("transform-origin")), style);
         else if (!strcmp(cur->Name(), "mask") || !strcmp(cur->Name(), "use"))
             flags |= SVG_IMPORT_UNSUPPORTED_FEATURE_FLAG;
         else {
@@ -740,10 +816,9 @@ static void gatherPaths(SkPath &fullPath, int &flags, tinyxml2::XMLElement *pare
             if (fillRule && !strcmp(fillRule, "evenodd"))
                 curPath.setFillType(SkPathFillType::kEvenOdd);
             curPath.transform(combineTransformation(flags, transformation, cur->Attribute("transform"), cur->Attribute("transform-origin")));
-            if (Op(fullPath, curPath, kUnion_SkPathOp, &fullPath))
-                flags |= SVG_IMPORT_SUCCESS_FLAG;
-            else
-                flags |= SVG_IMPORT_PARTIAL_FAILURE_FLAG;
+            SvgStyle curStyle = style;
+            readStyle(curStyle, cur->Attribute("fill"), cur->Attribute("stroke"), cur->Attribute("stroke-width"), cur->Attribute("stroke-linecap"), cur->Attribute("stroke-linejoin"));
+            applyPath(fullPath, flags, curPath, curStyle);
         }
     }
 }
@@ -758,7 +833,7 @@ int loadSvgShape(Shape &output, Shape::Bounds &viewBox, const char *filename) {
 
     SkPath fullPath;
     int flags = 0;
-    gatherPaths(fullPath, flags, root, SkMatrix());
+    gatherPaths(fullPath, flags, root, SkMatrix(), SvgStyle());
     if (!((flags&SVG_IMPORT_SUCCESS_FLAG) && Simplify(fullPath, &fullPath)))
         return SVG_IMPORT_FAILURE;
     shapeFromSkiaPath(output, fullPath);
@@ -799,12 +874,15 @@ int parseSvgShape(Shape &output, Shape::Bounds &viewBox, const char *svgData, si
             Vector2 pos, dims, radius;
             StrRange pathDef;
             bool fillRuleEvenOdd;
+            StrRange fill, stroke, strokeWidth, strokeLinecap, strokeLinejoin;
             ElementData() : fillRuleEvenOdd(false) { }
         } elem;
 
         int ignoredDepth;
         SkMatrix transformation;
         std::stack<SkMatrix> transformationStack;
+        SvgStyle style;
+        std::stack<SvgStyle> styleStack;
 
     public:
         int flags;
@@ -854,6 +932,8 @@ int parseSvgShape(Shape &output, Shape::Bounds &viewBox, const char *svgData, si
                     return false;
                 transformation = transformationStack.top();
                 transformationStack.pop();
+                style = styleStack.top();
+                styleStack.pop();
             }
             return true;
         }
@@ -937,6 +1017,27 @@ int parseSvgShape(Shape &output, Shape::Bounds &viewBox, const char *svgData, si
                     break;
                 default:;
             }
+            switch (curElement) {
+                case PATH:
+                case RECT:
+                case CIRCLE:
+                case ELLIPSE:
+                case POLYGON:
+                case G:
+                case SVG:
+                    if (SVG_NAME_IS("fill"))
+                        elem.fill = StrRange(valueStart, valueEnd);
+                    else if (SVG_NAME_IS("stroke"))
+                        elem.stroke = StrRange(valueStart, valueEnd);
+                    else if (SVG_NAME_IS("stroke-width"))
+                        elem.strokeWidth = StrRange(valueStart, valueEnd);
+                    else if (SVG_NAME_IS("stroke-linecap"))
+                        elem.strokeLinecap = StrRange(valueStart, valueEnd);
+                    else if (SVG_NAME_IS("stroke-linejoin"))
+                        elem.strokeLinejoin = StrRange(valueStart, valueEnd);
+                    break;
+                default:;
+            }
             return true;
         }
 
@@ -944,11 +1045,24 @@ int parseSvgShape(Shape &output, Shape::Bounds &viewBox, const char *svgData, si
             switch (curElement) {
                 case BEGINNING:
                 case IGNORED:
-                case SVG:
                     break;
+                case SVG:
                 case G:
-                    transformationStack.push(transformation);
-                    transformation = combineTransformation(flags, transformation, elem.transform.str().c_str(), elem.transformOrigin.str().c_str());
+                    if (curElement == G) {
+                        transformationStack.push(transformation);
+                        transformation = combineTransformation(flags, transformation, elem.transform.str().c_str(), elem.transformOrigin.str().c_str());
+                        styleStack.push(style);
+                    }
+                    if (elem.fill.start || elem.stroke.start || elem.strokeWidth.start || elem.strokeLinecap.start || elem.strokeLinejoin.start) {
+                        std::string fillStr = elem.fill.str(), strokeStr = elem.stroke.str(), strokeWidthStr = elem.strokeWidth.str(), strokeLinecapStr = elem.strokeLinecap.str(), strokeLinejoinStr = elem.strokeLinejoin.str();
+                        readStyle(style,
+                            elem.fill.start ? fillStr.c_str() : NULL,
+                            elem.stroke.start ? strokeStr.c_str() : NULL,
+                            elem.strokeWidth.start ? strokeWidthStr.c_str() : NULL,
+                            elem.strokeLinecap.start ? strokeLinecapStr.c_str() : NULL,
+                            elem.strokeLinejoin.start ? strokeLinejoinStr.c_str() : NULL
+                        );
+                    }
                     break;
                 case PATH:
                 case RECT:
@@ -1013,10 +1127,18 @@ int parseSvgShape(Shape &output, Shape::Bounds &viewBox, const char *svgData, si
                         if (elem.fillRuleEvenOdd)
                             curPath.setFillType(SkPathFillType::kEvenOdd);
                         curPath.transform(combineTransformation(flags, transformation, elem.transform.str().c_str(), elem.transformOrigin.str().c_str()));
-                        if (Op(fullPath, curPath, kUnion_SkPathOp, &fullPath))
-                            flags |= SVG_IMPORT_SUCCESS_FLAG;
-                        else
-                            flags |= SVG_IMPORT_PARTIAL_FAILURE_FLAG;
+                        SvgStyle curStyle = style;
+                        if (elem.fill.start || elem.stroke.start || elem.strokeWidth.start || elem.strokeLinecap.start || elem.strokeLinejoin.start) {
+                            std::string fillStr = elem.fill.str(), strokeStr = elem.stroke.str(), strokeWidthStr = elem.strokeWidth.str(), strokeLinecapStr = elem.strokeLinecap.str(), strokeLinejoinStr = elem.strokeLinejoin.str();
+                            readStyle(curStyle,
+                                elem.fill.start ? fillStr.c_str() : NULL,
+                                elem.stroke.start ? strokeStr.c_str() : NULL,
+                                elem.strokeWidth.start ? strokeWidthStr.c_str() : NULL,
+                                elem.strokeLinecap.start ? strokeLinecapStr.c_str() : NULL,
+                                elem.strokeLinejoin.start ? strokeLinejoinStr.c_str() : NULL
+                            );
+                        }
+                        applyPath(fullPath, flags, curPath, curStyle);
                     }
                     break;
             }
